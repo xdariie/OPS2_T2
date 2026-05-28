@@ -6,8 +6,6 @@ void usage(char *name) { fprintf(stderr, "USAGE: %s port \n", name); }
 #define BOARD_SIZE 100
 #define MAX_MSG_LEN 512
 
-/* --- DATA STRUCTURES --- */
-
 typedef struct spell_node {
     char name[32];
     int x;
@@ -22,19 +20,16 @@ typedef struct request_node {
     struct request_node *next;
 } request_node_t;
 
-// 1. The Shared State Struct (Replaces Globals)
 typedef struct {
     request_node_t *head;
     pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
 } priority_queue_t;
 
-// 2. The Thread Wrapper Struct
 typedef struct {
     char *buffer;
     priority_queue_t *pq;
 } thread_arg_t;
-
-/* --- FUNCTION DEFINITIONS --- */
 
 
 
@@ -52,7 +47,6 @@ int make_udp_socket(int port) {
     return fd;
 }
 
-// 3. Updated Insert Logic (Requires passing the queue pointer)
 void insert_into_priority_queue(priority_queue_t *pq, request_node_t *new_req) {
     pthread_mutex_lock(&pq->mutex);
 
@@ -68,6 +62,7 @@ void insert_into_priority_queue(priority_queue_t *pq, request_node_t *new_req) {
         current->next = new_req;
     }
 
+    pthread_cond_signal(&pq->not_empty);
     pthread_mutex_unlock(&pq->mutex);
 }
 
@@ -157,24 +152,21 @@ spell_node_t* parse_spells_list(char *spells_str) {
     return head;
 }
 
-// 4. Updated Worker Thread (Unpacks the wrapper struct)
 void *worker_thread(void *arg) {
     pthread_detach(pthread_self());
     
-    // Unpack arguments
     thread_arg_t *t_args = (thread_arg_t *)arg;
     char *buffer = t_args->buffer;
     priority_queue_t *pq = t_args->pq;
     
     char *saveptr;
-
     char *colon_part1 = strtok_r(buffer, ":", &saveptr);
     char *colon_part2 = strtok_r(NULL, ":", &saveptr);
 
     if (!colon_part1 || !colon_part2) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
         free(buffer);
-        free(t_args); // Free wrapper!
+        free(t_args);
         return NULL;
     }
 
@@ -182,7 +174,7 @@ void *worker_thread(void *arg) {
     if (req == NULL) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
         free(buffer);
-        free(t_args); // Free wrapper!
+        free(t_args);
         return NULL;
     }
 
@@ -191,20 +183,47 @@ void *worker_thread(void *arg) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
         free(req);
         free(buffer);
-        free(t_args); // Free wrapper!
+        free(t_args);
         return NULL;
     }
 
     insert_into_priority_queue(pq, req);
     printf("[Queued] %s's request safely stored.\n", req->mage_name);
 
-    // Cleanup memory
     free(buffer);
     free(t_args);
     return NULL;
 }
 
-// 5. Updated Server Loop (Passes context via struct)
+void *archmage_thread(void *arg) {
+    priority_queue_t *pq = (priority_queue_t *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&pq->mutex);
+
+        while (pq->head == NULL) {
+            pthread_cond_wait(&pq->not_empty, &pq->mutex);
+        }
+
+        request_node_t *req = pq->head;
+        pq->head = req->next;
+
+        pthread_mutex_unlock(&pq->mutex);
+
+        spell_node_t *curr = req->spells_head;
+        while (curr != NULL) {
+            usleep(200000);
+            curr = curr->next;
+        }
+
+        printf("[Processed] Archmage completed request for %s.\n", req->mage_name);
+
+        free_spells_list(req->spells_head);
+        free(req);
+    }
+    return NULL;
+}
+
 void run_server(int fd, priority_queue_t *pq) {
     char temp_buffer[MAX_MSG_LEN];
 
@@ -220,20 +239,15 @@ void run_server(int fd, priority_queue_t *pq) {
         if (!thread_buffer) ERR("malloc");
         strcpy(thread_buffer, temp_buffer);
 
-        // Allocate and pack the wrapper struct
         thread_arg_t *t_args = malloc(sizeof(thread_arg_t));
         if (!t_args) ERR("malloc");
         t_args->buffer = thread_buffer;
         t_args->pq = pq;
 
         pthread_t tid;
-        if (pthread_create(&tid, NULL, worker_thread, t_args) != 0) {
-            ERR("pthread_create");
-        }
+        if (pthread_create(&tid, NULL, worker_thread, t_args) != 0) ERR("pthread_create");
     }
 }
-
-/* --- MAIN --- */
 
 int main(int argc, char **argv) {
     if (argc != 2) {
@@ -244,16 +258,19 @@ int main(int argc, char **argv) {
     int port = atoi(argv[1]);
     int fd = make_udp_socket(port);
 
-    // Initialize the shared state directly in main's stack
     priority_queue_t pq;
     pq.head = NULL;
     if (pthread_mutex_init(&pq.mutex, NULL) != 0) ERR("pthread_mutex_init");
+    if (pthread_cond_init(&pq.not_empty, NULL) != 0) ERR("pthread_cond_init");
 
-    // Pass it to the server loop
+    pthread_t archmage_tid;
+    if (pthread_create(&archmage_tid, NULL, archmage_thread, &pq) != 0) ERR("pthread_create");
+
     run_server(fd, &pq);
 
     if (close(fd) < 0) ERR("close");
     pthread_mutex_destroy(&pq.mutex);
+    pthread_cond_destroy(&pq.not_empty);
 
     return EXIT_SUCCESS;
 }
