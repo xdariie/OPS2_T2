@@ -32,7 +32,6 @@ typedef struct {
 } thread_arg_t;
 
 
-
 int make_udp_socket(int port) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) ERR("socket");
@@ -66,39 +65,61 @@ void insert_into_priority_queue(priority_queue_t *pq, request_node_t *new_req) {
     pthread_mutex_unlock(&pq->mutex);
 }
 
+// Stage 4: Revoke Logic
+void revoke_spell(priority_queue_t *pq, const char *mage_name, const char *spell_name) {
+    pthread_mutex_lock(&pq->mutex);
+
+    request_node_t *curr_req = pq->head;
+    request_node_t *prev_req = NULL;
+
+    while (curr_req != NULL) {
+        if (strcmp(curr_req->mage_name, mage_name) == 0) {
+            
+            spell_node_t *curr_spell = curr_req->spells_head;
+            spell_node_t *prev_spell = NULL;
+
+            while (curr_spell != NULL) {
+                if (strcmp(curr_spell->name, spell_name) == 0) {
+                    
+                    if (prev_spell == NULL) {
+                        curr_req->spells_head = curr_spell->next;
+                    } else {
+                        prev_spell->next = curr_spell->next;
+                    }
+                    free(curr_spell);
+
+                    printf("[Revoked] %s cancelled for %s.\n", spell_name, mage_name);
+
+                    if (curr_req->spells_head == NULL) {
+                        if (prev_req == NULL) {
+                            pq->head = curr_req->next;
+                        } else {
+                            prev_req->next = curr_req->next;
+                        }
+                        free(curr_req);
+                    }
+
+                    pthread_mutex_unlock(&pq->mutex);
+                    return; 
+                }
+                prev_spell = curr_spell;
+                curr_spell = curr_spell->next;
+            }
+        }
+        prev_req = curr_req;
+        curr_req = curr_req->next;
+    }
+
+    printf("[Too Late] The spell was already cast.\n");
+    pthread_mutex_unlock(&pq->mutex);
+}
+
 void free_spells_list(spell_node_t *head) {
     while (head != NULL) {
         spell_node_t *temp = head;
         head = head->next;
         free(temp);
     }
-}
-
-request_node_t* parse_request_header(char *header_str) {
-    char *saveptr;
-    char *cmd = strtok_r(header_str, " \t\r\n", &saveptr);
-    char *prio_str = strtok_r(NULL, " \t\r\n", &saveptr);
-    char *name = strtok_r(NULL, " \t\r\n", &saveptr);
-
-    if (!cmd || strcmp(cmd, "SUBMIT") != 0 || !prio_str || !name || strlen(name) > 16) {
-        return NULL; 
-    }
-
-    int priority = atoi(prio_str);
-    if (priority < 1 || priority > 5) {
-        return NULL; 
-    }
-
-    request_node_t *req = malloc(sizeof(request_node_t));
-    if (!req) ERR("malloc");
-    
-    req->priority = priority;
-    strncpy(req->mage_name, name, 31);
-    req->mage_name[31] = '\0';
-    req->spells_head = NULL;
-    req->next = NULL;
-
-    return req;
 }
 
 spell_node_t* parse_spells_list(char *spells_str) {
@@ -152,6 +173,7 @@ spell_node_t* parse_spells_list(char *spells_str) {
     return head;
 }
 
+// Updated Worker Thread to handle both SUBMIT and REVOKE
 void *worker_thread(void *arg) {
     pthread_detach(pthread_self());
     
@@ -159,36 +181,69 @@ void *worker_thread(void *arg) {
     char *buffer = t_args->buffer;
     priority_queue_t *pq = t_args->pq;
     
-    char *saveptr;
-    char *colon_part1 = strtok_r(buffer, ":", &saveptr);
-    char *colon_part2 = strtok_r(NULL, ":", &saveptr);
+    char *saveptr1;
+    char *colon_part1 = strtok_r(buffer, ":", &saveptr1);
+    char *colon_part2 = strtok_r(NULL, ":", &saveptr1);
 
     if (!colon_part1 || !colon_part2) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
-        free(buffer);
-        free(t_args);
-        return NULL;
+        free(buffer); free(t_args); return NULL;
     }
 
-    request_node_t *req = parse_request_header(colon_part1);
-    if (req == NULL) {
+    char *saveptr2;
+    char *cmd = strtok_r(colon_part1, " \t\r\n", &saveptr2);
+
+    if (!cmd) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
-        free(buffer);
-        free(t_args);
-        return NULL;
+        free(buffer); free(t_args); return NULL;
     }
 
-    req->spells_head = parse_spells_list(colon_part2);
-    if (req->spells_head == NULL) {
+    if (strcmp(cmd, "SUBMIT") == 0) {
+        char *prio_str = strtok_r(NULL, " \t\r\n", &saveptr2);
+        char *name = strtok_r(NULL, " \t\r\n", &saveptr2);
+
+        if (!prio_str || !name || strlen(name) > 16) {
+            fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
+            free(buffer); free(t_args); return NULL;
+        }
+
+        int priority = atoi(prio_str);
+        if (priority < 1 || priority > 5) {
+            fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
+            free(buffer); free(t_args); return NULL;
+        }
+
+        request_node_t *req = malloc(sizeof(request_node_t));
+        req->priority = priority;
+        strncpy(req->mage_name, name, 31);
+        req->mage_name[31] = '\0';
+        req->spells_head = parse_spells_list(colon_part2);
+        req->next = NULL;
+
+        if (req->spells_head == NULL) {
+            fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
+            free(req); free(buffer); free(t_args); return NULL;
+        }
+
+        insert_into_priority_queue(pq, req);
+        printf("[Queued] %s's request safely stored.\n", req->mage_name);
+
+    } else if (strcmp(cmd, "REVOKE") == 0) {
+        char *name = strtok_r(NULL, " \t\r\n", &saveptr2);
+        
+        char *saveptr3;
+        char *spell_name = strtok_r(colon_part2, " \t\r\n;", &saveptr3);
+
+        if (!name || !spell_name || strlen(name) > 16) {
+            fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
+            free(buffer); free(t_args); return NULL;
+        }
+
+        revoke_spell(pq, name, spell_name);
+
+    } else {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
-        free(req);
-        free(buffer);
-        free(t_args);
-        return NULL;
     }
-
-    insert_into_priority_queue(pq, req);
-    printf("[Queued] %s's request safely stored.\n", req->mage_name);
 
     free(buffer);
     free(t_args);
@@ -212,7 +267,7 @@ void *archmage_thread(void *arg) {
 
         spell_node_t *curr = req->spells_head;
         while (curr != NULL) {
-            usleep(200000);
+            usleep(200000); // Wait 200ms
             curr = curr->next;
         }
 
