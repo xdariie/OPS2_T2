@@ -2,9 +2,11 @@
 
 void usage(char *name) { fprintf(stderr, "USAGE: %s port \n", name); }
 
-#define MAX_MSG_LEN 512
-#define NAME_SIZE 16
+
 #define BOARD_SIZE 100
+#define MAX_MSG_LEN 512
+
+/* --- DATA STRUCTURES --- */
 
 typedef struct spell_node {
     char name[32];
@@ -20,15 +22,22 @@ typedef struct request_node {
     struct request_node *next;
 } request_node_t;
 
-// Global Queue Pointers and Mutex
-request_node_t *queue_head = NULL;
-pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+// 1. The Shared State Struct (Replaces Globals)
+typedef struct {
+    request_node_t *head;
+    pthread_mutex_t mutex;
+} priority_queue_t;
+
+// 2. The Thread Wrapper Struct
+typedef struct {
+    char *buffer;
+    priority_queue_t *pq;
+} thread_arg_t;
 
 /* --- FUNCTION DEFINITIONS --- */
 
 
 
-// 1. Socket Setup Helper
 int make_udp_socket(int port) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) ERR("socket");
@@ -43,15 +52,15 @@ int make_udp_socket(int port) {
     return fd;
 }
 
-// 2. Queue Insertion Logic
-void insert_into_priority_queue(request_node_t *new_req) {
-    pthread_mutex_lock(&queue_mutex);
+// 3. Updated Insert Logic (Requires passing the queue pointer)
+void insert_into_priority_queue(priority_queue_t *pq, request_node_t *new_req) {
+    pthread_mutex_lock(&pq->mutex);
 
-    if (queue_head == NULL || new_req->priority < queue_head->priority) {
-        new_req->next = queue_head;
-        queue_head = new_req;
+    if (pq->head == NULL || new_req->priority < pq->head->priority) {
+        new_req->next = pq->head;
+        pq->head = new_req;
     } else {
-        request_node_t *current = queue_head;
+        request_node_t *current = pq->head;
         while (current->next != NULL && current->next->priority <= new_req->priority) {
             current = current->next;
         }
@@ -59,10 +68,9 @@ void insert_into_priority_queue(request_node_t *new_req) {
         current->next = new_req;
     }
 
-    pthread_mutex_unlock(&queue_mutex);
+    pthread_mutex_unlock(&pq->mutex);
 }
 
-// 3. Memory Cleanup Helper
 void free_spells_list(spell_node_t *head) {
     while (head != NULL) {
         spell_node_t *temp = head;
@@ -71,7 +79,6 @@ void free_spells_list(spell_node_t *head) {
     }
 }
 
-// 4. Header Parser (Validates "SUBMIT Priority Name")
 request_node_t* parse_request_header(char *header_str) {
     char *saveptr;
     char *cmd = strtok_r(header_str, " \t\r\n", &saveptr);
@@ -79,12 +86,12 @@ request_node_t* parse_request_header(char *header_str) {
     char *name = strtok_r(NULL, " \t\r\n", &saveptr);
 
     if (!cmd || strcmp(cmd, "SUBMIT") != 0 || !prio_str || !name || strlen(name) > 16) {
-        return NULL; // Invalid format
+        return NULL; 
     }
 
     int priority = atoi(prio_str);
     if (priority < 1 || priority > 5) {
-        return NULL; // Invalid priority bounds
+        return NULL; 
     }
 
     request_node_t *req = malloc(sizeof(request_node_t));
@@ -99,12 +106,11 @@ request_node_t* parse_request_header(char *header_str) {
     return req;
 }
 
-// 5. Spells Parser (Builds the inner linked list of spells)
 spell_node_t* parse_spells_list(char *spells_str) {
     char *saveptr_sc;
     char *spell_token = strtok_r(spells_str, ";", &saveptr_sc);
     
-    if (!spell_token) return NULL; // No spells found
+    if (!spell_token) return NULL; 
 
     spell_node_t *head = NULL;
     spell_node_t *tail = NULL;
@@ -151,49 +157,55 @@ spell_node_t* parse_spells_list(char *spells_str) {
     return head;
 }
 
-// 6. Thread Worker (Acts as the bridge calling the parsers)
+// 4. Updated Worker Thread (Unpacks the wrapper struct)
 void *worker_thread(void *arg) {
     pthread_detach(pthread_self());
-    char *buffer = (char *)arg;
+    
+    // Unpack arguments
+    thread_arg_t *t_args = (thread_arg_t *)arg;
+    char *buffer = t_args->buffer;
+    priority_queue_t *pq = t_args->pq;
+    
     char *saveptr;
 
-    // Split at the colon
     char *colon_part1 = strtok_r(buffer, ":", &saveptr);
     char *colon_part2 = strtok_r(NULL, ":", &saveptr);
 
     if (!colon_part1 || !colon_part2) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
         free(buffer);
+        free(t_args); // Free wrapper!
         return NULL;
     }
 
-    // Parse the Header
     request_node_t *req = parse_request_header(colon_part1);
     if (req == NULL) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
         free(buffer);
+        free(t_args); // Free wrapper!
         return NULL;
     }
 
-    // Parse the Spells
     req->spells_head = parse_spells_list(colon_part2);
     if (req->spells_head == NULL) {
         fprintf(stderr, "[Error] Malformed telepathy from an apprentice\n");
         free(req);
         free(buffer);
+        free(t_args); // Free wrapper!
         return NULL;
     }
 
-    // Success! Queue it up.
-    insert_into_priority_queue(req);
+    insert_into_priority_queue(pq, req);
     printf("[Queued] %s's request safely stored.\n", req->mage_name);
 
+    // Cleanup memory
     free(buffer);
+    free(t_args);
     return NULL;
 }
 
-// 7. Core Server Loop
-void run_server(int fd) {
+// 5. Updated Server Loop (Passes context via struct)
+void run_server(int fd, priority_queue_t *pq) {
     char temp_buffer[MAX_MSG_LEN];
 
     while (1) {
@@ -208,8 +220,14 @@ void run_server(int fd) {
         if (!thread_buffer) ERR("malloc");
         strcpy(thread_buffer, temp_buffer);
 
+        // Allocate and pack the wrapper struct
+        thread_arg_t *t_args = malloc(sizeof(thread_arg_t));
+        if (!t_args) ERR("malloc");
+        t_args->buffer = thread_buffer;
+        t_args->pq = pq;
+
         pthread_t tid;
-        if (pthread_create(&tid, NULL, worker_thread, thread_buffer) != 0) {
+        if (pthread_create(&tid, NULL, worker_thread, t_args) != 0) {
             ERR("pthread_create");
         }
     }
@@ -226,10 +244,16 @@ int main(int argc, char **argv) {
     int port = atoi(argv[1]);
     int fd = make_udp_socket(port);
 
-    run_server(fd);
+    // Initialize the shared state directly in main's stack
+    priority_queue_t pq;
+    pq.head = NULL;
+    if (pthread_mutex_init(&pq.mutex, NULL) != 0) ERR("pthread_mutex_init");
+
+    // Pass it to the server loop
+    run_server(fd, &pq);
 
     if (close(fd) < 0) ERR("close");
-    pthread_mutex_destroy(&queue_mutex);
+    pthread_mutex_destroy(&pq.mutex);
 
     return EXIT_SUCCESS;
 }
